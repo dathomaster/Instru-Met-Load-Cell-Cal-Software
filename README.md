@@ -58,6 +58,8 @@ The app supports scientific notation such as:
 ```
 
 ### OCR Stream
+<img width="645" height="1398" alt="IMG_1197" src="https://github.com/user-attachments/assets/ab435d85-9ed7-433b-b137-0a59bd621c93" />
+
 
 The iPhone OCR app sends OCR values to the laptop over UDP.
 
