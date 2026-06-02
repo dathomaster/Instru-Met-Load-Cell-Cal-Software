@@ -1,5 +1,6 @@
+HADI + OCR Capture Software
 <img width="2186" height="1520" alt="image" src="https://github.com/user-attachments/assets/cf79980b-c220-478d-a18b-bc7318e53171" />
-# HADI + OCR Capture Software
+
 
 A Windows desktop application for comparing force readings from a **Morehouse HADI digital indicator** against an **OCR stream from an iPhone camera app**. The software is designed for calibration/check workflows where a HADI/load cell reading and a displayed OCR reading need to be captured together, compared, and saved to CSV.
 
