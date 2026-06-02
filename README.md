@@ -1,4 +1,4 @@
-HADI + OCR Capture Software
+## HADI + OCR Capture Software
 <img width="2186" height="1520" alt="image" src="https://github.com/user-attachments/assets/cf79980b-c220-478d-a18b-bc7318e53171" />
 
 
