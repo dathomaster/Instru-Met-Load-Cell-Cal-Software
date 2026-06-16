@@ -42,6 +42,7 @@ class Reading:
     value: float
     timestamp: float       # phone-side unix time when OCR'd
     received_at: float     # local unix time when received
+    raw_text: str = ""     # exact numeric text received from the phone
 
 
 @dataclass
@@ -193,7 +194,7 @@ class OCRReceiver:
                         self.rejected_count += 1
                         continue
 
-                r = Reading(value=val, timestamp=ts, received_at=time.time())
+                r = Reading(value=val, timestamp=ts, received_at=time.time(), raw_text=raw_str)
                 with self._latest_lock:
                     self._latest = r
                 try:

@@ -129,6 +129,12 @@ def format_coeff(value) -> str:
 
 STANDARD_GRAVITY = 9.80665
 
+# GPS must never be required for capture. By default the app uses standard
+# gravity for weight-reference/W rows, so captures keep working in buildings,
+# labs, or other areas with poor/no GPS. Set this to True only when you
+# intentionally want GPS latitude/elevation gravity correction applied.
+USE_GPS_GRAVITY_CORRECTION = False
+
 ASTM_MF_LATITUDES = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70]
 ASTM_MF_ELEVATIONS_M = [0, 500, 1000, 1500, 2000, 2500]
 ASTM_MF_TABLE = {
@@ -267,6 +273,7 @@ class OCRTimedReading:
     pc_time: float
     wall_time: float
     phone_time: float
+    raw_text: str = ""
 
 
 @dataclass
@@ -430,7 +437,7 @@ class App(tk.Tk):
         self._last_sync_update = 0.0
 
         self.latest_gps: Optional[GPSFix] = None
-        self.gps_status_var = tk.StringVar(value="GPS: waiting")
+        self.gps_status_var = tk.StringVar(value="GPS optional: waiting (W uses standard gravity)")
         self.weight_status_var = tk.StringVar(value="Select rows and click SELECT / UNSELECT W")
         self.manual_weight_var = tk.StringVar(value="")
         self.weight_choice_var = tk.StringVar(value="")
@@ -442,6 +449,7 @@ class App(tk.Tk):
         self.hadi_decimals_var = tk.StringVar(value="0.00001")
         self.hadi_title_var = tk.StringVar(value="HADI Force (LBF)")
         self.mode_badge_var = tk.StringVar(value="COMPRESSION")
+        self.capacity_warning_var = tk.StringVar(value="")
         self.poll_var = tk.StringVar(value="10")
         self.ocr_port_var = tk.StringVar(value="9999")
         self.status_var = tk.StringVar(value="Disconnected")
@@ -503,6 +511,7 @@ class App(tk.Tk):
         style.configure("TinyValue.TLabel", font=("Consolas", 9))
         style.configure("ModeBadgeCompression.TLabel", font=("Segoe UI", 11, "bold"), foreground="#0f5f5c", background="#d7f4f1", padding=(12, 6))
         style.configure("ModeBadgeTension.TLabel", font=("Segoe UI", 11, "bold"), foreground="#5b2a86", background="#efe3fb", padding=(12, 6))
+        style.configure("CapacityWarning.TLabel", font=("Segoe UI", 11, "bold"), foreground="#c1121f", padding=(8, 6))
         style.configure("Zero.TButton", font=("Segoe UI", 9, "bold"))
         style.configure("Override.TButton", font=("Segoe UI", 10, "bold"), padding=(10, 6))
         style.configure("BigCapture.TButton", font=("Segoe UI", 16, "bold"), padding=(18, 14))
@@ -563,8 +572,13 @@ class App(tk.Tk):
 
         mode_bar = ttk.Frame(root)
         mode_bar.pack(fill="x", padx=10, pady=(0, 2))
+        mode_bar.columnconfigure(0, weight=1)
+        mode_bar.columnconfigure(1, weight=0)
+        mode_bar.columnconfigure(2, weight=1)
         self.mode_badge_label = ttk.Label(mode_bar, textvariable=self.mode_badge_var, style="ModeBadgeCompression.TLabel")
-        self.mode_badge_label.pack(anchor="center")
+        self.mode_badge_label.grid(row=0, column=1, sticky="e")
+        self.capacity_warning_label = ttk.Label(mode_bar, textvariable=self.capacity_warning_var, style="CapacityWarning.TLabel")
+        self.capacity_warning_label.grid(row=0, column=2, sticky="w", padx=(8, 0))
 
         display = ttk.Frame(root)
         display.pack(fill="both", expand=True, **pad)
@@ -812,6 +826,9 @@ class App(tk.Tk):
         self._refresh_hadi_mode_badge()
         if self.latest_hadi:
             self.hadi_lbf_var.set(self._format_hadi_display_value(self.latest_hadi))
+            self._update_capacity_warning(self.latest_hadi)
+        else:
+            self._update_capacity_warning(None)
 
     def _refresh_hadi_mode_badge(self):
         mode = self.mode_var.get()
@@ -819,6 +836,40 @@ class App(tk.Tk):
         if hasattr(self, "mode_badge_label"):
             style = "ModeBadgeCompression.TLabel" if mode == "Compression" else "ModeBadgeTension.TLabel"
             self.mode_badge_label.configure(style=style)
+
+    @staticmethod
+    def _format_ocr_number(value) -> str:
+        """Display OCR without forcing four decimals.
+
+        When raw OCR text is unavailable, fall back to a compact numeric string
+        rather than rounding to a fixed number of places.
+        """
+        if value in (None, ""):
+            return ""
+        try:
+            return f"{float(value):+g}"
+        except Exception:
+            text = str(value).strip()
+            return text if text.startswith(("+", "-")) else f"+{text}"
+
+    @staticmethod
+    def _format_ocr_text(raw_text, value=None, show_plus: bool = True) -> str:
+        text = "" if raw_text in (None, "") else str(raw_text).strip()
+        if not text and value not in (None, ""):
+            text = f"{float(value):g}"
+        if not text:
+            return ""
+        if show_plus and not text.startswith(("+", "-")):
+            return "+" + text
+        if not show_plus and text.startswith("+"):
+            return text[1:]
+        return text
+
+    @classmethod
+    def _ocr_text_for_row(cls, run_row, show_plus: bool = True) -> str:
+        if not run_row or run_row.get("ocr") in (None, ""):
+            return ""
+        return cls._format_ocr_text(run_row.get("ocr_text"), run_row.get("ocr"), show_plus=show_plus)
 
     def _format_hadi_display_value(self, reading: HADIReading) -> str:
         units = self.hadi_units_var.get()
@@ -829,6 +880,72 @@ class App(tk.Tk):
             factor = HADI_UNIT_FACTORS.get(units, 1.0)
             value = reading.force_lbf * factor
         return f"{value:+.{decimals}f}"
+
+    def _capacity_limit_lbf(self) -> Optional[float]:
+        """Return the selected load-cell capacity in lbf, or None if unset."""
+        cell = self._find_load_cell(self.selected_load_cell_name.get())
+        if not cell:
+            return None
+        try:
+            capacity = float(cell.get("capacity_lbf"))
+        except Exception:
+            return None
+        return capacity if capacity > 0 else None
+
+    def _format_force_for_current_units(self, force_lbf: float) -> str:
+        """Format a force value in the currently selected display unit."""
+        units = self.hadi_units_var.get()
+        if units == "mV/V":
+            return f"{force_lbf:.1f} LBF"
+        factor = HADI_UNIT_FACTORS.get(units, 1.0)
+        decimals = _decimals_from_step(self.hadi_decimals_var.get())
+        return f"{force_lbf * factor:.{decimals}f} {units}"
+
+    def _selected_hadi_decimals(self) -> int:
+        """Number of decimal places selected for HADI display/capture output."""
+        return _decimals_from_step(self.hadi_decimals_var.get())
+
+    def _format_hadi_lbf_text(self, value, show_plus: bool = False) -> str:
+        """Format captured HADI LBF with exactly the selected decimal count.
+
+        Capture rows keep this text so the table, autosave, and manual CSV export
+        all preserve the same decimal precision the operator selected at capture
+        time instead of later shortening/reformatting the float.
+        """
+        if value in (None, ""):
+            return ""
+        try:
+            decimals = self._selected_hadi_decimals()
+            sign = "+" if show_plus else ""
+            return f"{float(value):{sign}.{decimals}f}"
+        except Exception:
+            return str(value)
+
+    def _set_row_hadi_text(self, row: dict) -> None:
+        """Store the fixed-decimal HADI text used by table and CSV export."""
+        if row is not None:
+            row["hadi_text"] = self._format_hadi_lbf_text(row.get("hadi_lbf"), show_plus=False)
+
+    def _update_capacity_warning(self, reading: Optional[HADIReading] = None) -> None:
+        """Warn when the load cell force exceeds 105% of selected capacity.
+
+        The comparison is always done in lbf because calibration coefficients
+        produce lbf. The displayed warning follows the user's selected units.
+        """
+        capacity_lbf = self._capacity_limit_lbf()
+        if capacity_lbf is None or reading is None:
+            self.capacity_warning_var.set("")
+            return
+
+        force_lbf = abs(float(reading.force_lbf))
+        limit_lbf = capacity_lbf * 1.05
+        if force_lbf >= limit_lbf:
+            self.capacity_warning_var.set(
+                f"OVER CAPACITY: {self._format_force_for_current_units(force_lbf)} / "
+                f"{self._format_force_for_current_units(limit_lbf)} max"
+            )
+        else:
+            self.capacity_warning_var.set("")
 
     def _auto_connect_on_launch(self):
         # Start OCR listener automatically. It is just a local UDP listener,
@@ -907,6 +1024,7 @@ class App(tk.Tk):
     def _set_mode(self):
         self.hadi.mode = self.mode_var.get()
         self._refresh_hadi_mode_badge()
+        self._update_capacity_warning(self.latest_hadi)
 
     def _apply_poll_rate(self):
         try:
@@ -931,6 +1049,7 @@ class App(tk.Tk):
         if cell:
             self.hadi.load_cell = cell
             self.status_var.set(f"Using load cell: {cell['name']}")
+            self._update_capacity_warning(self.latest_hadi)
 
     def _sync_load_cell_controls(self):
         names = [c["name"] for c in self.load_cells]
@@ -1057,6 +1176,7 @@ class App(tk.Tk):
             pc_time=now_pc,
             wall_time=reading.received_at,
             phone_time=reading.timestamp,
+            raw_text=getattr(reading, "raw_text", "") or f"{reading.value:g}",
         )
         with self.ocr_lock:
             self.latest_ocr = sample
@@ -1076,14 +1196,40 @@ class App(tk.Tk):
             gravity_m_s2=g,
             gravity_factor=g / STANDARD_GRAVITY,
         )
+
+        # Always keep/display the latest GPS fix so the operator can verify that
+        # the phone is sending coordinates. By default W-row math still ignores
+        # GPS and uses standard gravity, so moving the phone cannot change the
+        # captured weight values.
         self.latest_gps = fix
-        if altitude_m is None:
+
+        if not USE_GPS_GRAVITY_CORRECTION:
+            if fix.altitude_m is None:
+                self.gps_status_var.set(
+                    f"GPS {fix.latitude:.5f}, {fix.longitude:.5f} | ASTM MF {fix.gravity_factor:.7f} | alt 0m | W uses standard g"
+                )
+            else:
+                self.gps_status_var.set(
+                    f"GPS {fix.latitude:.5f}, {fix.longitude:.5f} | alt {fix.altitude_m:.1f}m | ASTM MF {fix.gravity_factor:.7f} | W uses standard g"
+                )
+            return
+
+        # If GPS gravity correction is deliberately re-enabled later, lock to the
+        # first valid fix for the run so moving the phone up/down cannot give
+        # different W rows different gravity factors.
+        if not hasattr(self, "locked_gps"):
+            self.locked_gps = None
+        if self.locked_gps is None:
+            self.locked_gps = fix
+
+        locked = self.locked_gps
+        if locked.altitude_m is None:
             self.gps_status_var.set(
-                f"GPS {fix.latitude:.5f}, {fix.longitude:.5f} | ASTM MF {fix.gravity_factor:.7f} | alt 0m"
+                f"GPS locked {locked.latitude:.5f}, {locked.longitude:.5f} | ASTM MF {locked.gravity_factor:.7f} | alt 0m"
             )
         else:
             self.gps_status_var.set(
-                f"GPS {fix.latitude:.5f}, {fix.longitude:.5f} | alt {altitude_m:.1f}m | ASTM MF {fix.gravity_factor:.7f}"
+                f"GPS locked {locked.latitude:.5f}, {locked.longitude:.5f} | alt {locked.altitude_m:.1f}m | ASTM MF {locked.gravity_factor:.7f}"
             )
 
     @staticmethod
@@ -1101,12 +1247,8 @@ class App(tk.Tk):
             prev = cur
         return None
 
-    def _nearest_sample_value(self, samples, target_time, attr, corrected_ocr=False, max_age_seconds=0.75):
-        """Return the exact value from the nearest real sample.
-
-        This is intentionally used for OCR so the app never invents in-between
-        display values like 10.0473 when the phone only saw 10.0 or 10.1.
-        """
+    def _nearest_sample(self, samples, target_time, corrected_ocr=False, max_age_seconds=0.75):
+        """Return the nearest real sample, or None if it is too far away."""
         if not samples:
             return None
         nearest = min(
@@ -1116,7 +1258,16 @@ class App(tk.Tk):
         nearest_time = self._corrected_ocr_time(nearest) if corrected_ocr else nearest.pc_time
         if abs(nearest_time - target_time) > max_age_seconds:
             return None
-        return getattr(nearest, attr)
+        return nearest
+
+    def _nearest_sample_value(self, samples, target_time, attr, corrected_ocr=False, max_age_seconds=0.75):
+        """Return the exact value from the nearest real sample.
+
+        This is intentionally used for OCR so the app never invents in-between
+        display values like 10.0473 when the phone only saw 10.0 or 10.1.
+        """
+        nearest = self._nearest_sample(samples, target_time, corrected_ocr, max_age_seconds)
+        return None if nearest is None else getattr(nearest, attr)
 
     @staticmethod
     def _corr(xs, ys):
@@ -1234,6 +1385,7 @@ class App(tk.Tk):
         self.hadi_lbf_var.set("WAITING FOR HADI")
         self.hadi_raw_var.set("WAITING")
         self.raw_text_var.set("")
+        self._update_capacity_warning(None)
 
     def _set_ocr_waiting_display(self):
         with self.ocr_lock:
@@ -1262,6 +1414,7 @@ class App(tk.Tk):
             self._prune_buffers(item.pc_time)
             self.hadi_raw_var.set(f"{item.raw_response:+.5f}")
             self.hadi_lbf_var.set(self._format_hadi_display_value(item))
+            self._update_capacity_warning(item)
             self.raw_text_var.set(item.raw_text)
 
         if not got_hadi and not self._hadi_is_fresh(now_pc):
@@ -1273,7 +1426,7 @@ class App(tk.Tk):
             if r is None or not self._ocr_is_fresh(now_pc):
                 self._set_ocr_waiting_display()
             else:
-                self.ocr_value_var.set(f"{r.value:+.4f}")
+                self.ocr_value_var.set(self._format_ocr_text(r.raw_text, r.value))
         else:
             self._set_ocr_waiting_display()
 
@@ -1391,8 +1544,9 @@ class App(tk.Tk):
         point_label = f"{index + 1}w" if is_weight else str(index + 1)
         return (
             point_label,
-            fmt_lbf(float(run_row.get("hadi_lbf"))) if run_row and run_row.get("hadi_lbf") is not None else "",
-            self._format_run_value(run_row, "ocr", "+.4f"),
+            (run_row.get("hadi_text") or self._format_hadi_lbf_text(run_row.get("hadi_lbf"), show_plus=False))
+            if run_row and run_row.get("hadi_lbf") is not None else "",
+            self._ocr_text_for_row(run_row),
             self._format_run_percent(run_row),
         )
 
@@ -1592,7 +1746,7 @@ class App(tk.Tk):
                 else:
                     current_value = run_row.get("hadi_lbf", "")
             else:
-                current_value = run_row.get("ocr", "")
+                current_value = run_row.get("ocr_text", run_row.get("ocr", ""))
 
         entry = ttk.Entry(tree)
         if current_value != "":
@@ -1600,7 +1754,7 @@ class App(tk.Tk):
                 if kind == "hadi":
                     entry.insert(0, f"{float(current_value):g}")
                 else:
-                    entry.insert(0, f"{float(current_value):+.4f}".replace("+", ""))
+                    entry.insert(0, self._format_ocr_text(current_value, run_row.get("ocr"), show_plus=False))
             except Exception:
                 entry.insert(0, str(current_value).replace("+", ""))
         entry.select_range(0, "end")
@@ -1691,6 +1845,7 @@ class App(tk.Tk):
                 row = self._make_manual_weight_row(
                     new_value,
                     ocr_value=existing_ocr if existing_ocr not in ("", None) else None,
+                    ocr_text=existing.get("ocr_text", ""),
                 )
                 row["point"] = row_index + 1
                 row["run"] = run
@@ -1698,7 +1853,7 @@ class App(tk.Tk):
                 row["ocr_edited"] = existing.get("ocr_edited", False)
                 self.capture_rows[row_index][f"run{run}"] = row
                 self.weight_status_var.set(
-                    f"W weight updated: {new_value:g} lb -> {row['hadi_lbf']:.4f} LBF"
+                    f"W weight updated: {new_value:g} lb -> {row.get('hadi_text', self._format_hadi_lbf_text(row['hadi_lbf']))} LBF"
                 )
             else:
                 existing.update({
@@ -1722,7 +1877,9 @@ class App(tk.Tk):
                     "gps_latitude": "",
                     "gps_longitude": "",
                 })
+                self._set_row_hadi_text(existing)
                 existing.setdefault("ocr", "")
+                existing.setdefault("ocr_text", "")
                 existing.setdefault("ocr_edited", False)
                 self._recalculate_row_error(existing)
                 self.capture_rows[row_index][f"run{run}"] = existing
@@ -1733,6 +1890,7 @@ class App(tk.Tk):
                 return "break"
 
             run_row["ocr"] = new_value
+            run_row["ocr_text"] = raw
             run_row["ocr_edited"] = True
 
             try:
@@ -1741,7 +1899,7 @@ class App(tk.Tk):
                 hadi_value = None
 
             if hadi_value is not None and new_value != 0:
-                run_row["percent_error"] = ((hadi_value - new_value) / new_value) * 100.0
+                run_row["percent_error"] = ((new_value - hadi_value) / new_value) * 100.0
             else:
                 run_row["percent_error"] = None
 
@@ -1867,8 +2025,8 @@ class App(tk.Tk):
             if not run_row:
                 continue
             rows.append([
-                self._csv_fmt(run_row.get("ocr"), 4),
-                self._csv_fmt(run_row.get("hadi_lbf"), 4, " LBF"),
+                self._ocr_text_for_row(run_row, show_plus=False),
+                run_row.get("hadi_text") or self._format_hadi_lbf_text(run_row.get("hadi_lbf"), show_plus=False),
                 self._csv_fmt_error(run_row.get("percent_error")),
             ])
         return rows
@@ -1882,7 +2040,7 @@ class App(tk.Tk):
             writer = csv.writer(f)
 
             if self._run_has_data("run1"):
-                writer.writerow(["Run 1"])
+                writer.writerow(["Run 1 (HADI: LBF)"])
                 writer.writerow(self._capture_csv_fields())
                 run_rows = self._capture_csv_rows_for_run("run1")
                 writer.writerows(run_rows)
@@ -1891,7 +2049,7 @@ class App(tk.Tk):
             if self._run_has_data("run2"):
                 if total_rows:
                     writer.writerow([])
-                writer.writerow(["Run 2"])
+                writer.writerow(["Run 2 (HADI: LBF)"])
                 writer.writerow(self._capture_csv_fields())
                 run_rows = self._capture_csv_rows_for_run("run2")
                 writer.writerows(run_rows)
@@ -1955,16 +2113,17 @@ class App(tk.Tk):
             latest_ocr = self.latest_ocr
 
         if latest_ocr is not None and (now_pc - latest_ocr.pc_time) <= self.ocr_wait_seconds:
-            return now_pc, time.time(), latest_ocr.value
+            return now_pc, time.time(), latest_ocr.value, latest_ocr.raw_text
 
         if ocr_samples:
-            return now_pc, time.time(), ocr_samples[-1].value
+            sample = ocr_samples[-1]
+            return now_pc, time.time(), sample.value, sample.raw_text
 
         raise RuntimeError("Need at least one fresh OCR reading.")
 
     def _capture_into_weight_row(self, index: int, run: int, run_row: dict):
         try:
-            _now_pc, now_wall, ocr_value = self._current_exact_ocr_value()
+            _now_pc, now_wall, ocr_value, ocr_text = self._current_exact_ocr_value()
         except RuntimeError as exc:
             messagebox.showwarning("No OCR value", str(exc))
             return False
@@ -1988,8 +2147,10 @@ class App(tk.Tk):
         run_row["sync_confidence"] = ""
         run_row["target_delay_ms"] = ""
         run_row["ocr"] = ocr_value
+        run_row["ocr_text"] = ocr_text
         run_row["ocr_edited"] = False
-        run_row["percent_error"] = ((hadi_lbf - ocr_value) / ocr_value) * 100.0
+        run_row["percent_error"] = ((ocr_value - hadi_lbf) / ocr_value) * 100.0
+        self._set_row_hadi_text(run_row)
 
         tree = self._tree_for_run(run)
         item_id = tree.get_children()[index]
@@ -2060,7 +2221,7 @@ class App(tk.Tk):
                 ocr = self.latest_ocr.value if self.latest_ocr else None
             if hadi is None or ocr is None or ocr == 0:
                 raise ValueError
-            err = ((hadi - ocr) / ocr) * 100.0
+            err = ((ocr - hadi) / ocr) * 100.0
             self.live_error_var.set(f"{err:+.2f}%")
             self._set_live_error_color(err)
         except Exception:
@@ -2094,14 +2255,16 @@ class App(tk.Tk):
 
         # OCR is a screen reading, so use the nearest actual OCR packet instead
         # of interpolating and inventing decimal values that were never displayed.
-        ocr_value = self._nearest_sample_value(ocr_samples, target_t, "value", corrected_ocr=True)
+        ocr_sample = self._nearest_sample(ocr_samples, target_t, corrected_ocr=True)
+        ocr_value = None if ocr_sample is None else ocr_sample.value
+        ocr_text = "" if ocr_sample is None else ocr_sample.raw_text
 
         if hadi_lbf is None or ocr_value is None:
             raise RuntimeError("Could not match fresh HADI/OCR readings at the same corrected instant.")
-        return now_pc, time.time(), target_t, hadi_lbf, hadi_raw, ocr_value
+        return now_pc, time.time(), target_t, hadi_lbf, hadi_raw, ocr_value, ocr_text
 
     def _gravity_context(self):
-        gps = self.latest_gps
+        gps = getattr(self, "locked_gps", None) if USE_GPS_GRAVITY_CORRECTION else None
         if gps is None:
             return {
                 "gravity_factor": 1.0,
@@ -2109,8 +2272,8 @@ class App(tk.Tk):
                 "gps_latitude": "",
                 "gps_longitude": "",
                 "gps_altitude_m": "",
-                "gps_altitude_m": "",
-                "note": "no GPS; standard gravity",
+                "note": "standard gravity; GPS not required",
+                "using_gps": False,
             }
         return {
             "gravity_factor": gps.gravity_factor,
@@ -2123,6 +2286,7 @@ class App(tk.Tk):
                 if gps.altitude_m is not None
                 else f"ASTM MF {gps.gravity_factor:.7f}, alt 0m"
             ),
+            "using_gps": True,
         }
 
     def _current_target_ocr_value(self):
@@ -2135,23 +2299,23 @@ class App(tk.Tk):
             return None
         return run_row.get("ocr")
 
-    def _make_manual_weight_row(self, nominal_weight_lbf: float, ocr_value=None) -> dict:
+    def _make_manual_weight_row(self, nominal_weight_lbf: float, ocr_value=None, ocr_text="") -> dict:
         now_wall = time.time()
         ctx = self._gravity_context()
         gravity_factor = ctx["gravity_factor"]
         reference_lbf = nominal_weight_lbf * gravity_factor
 
         if ocr_value not in (None, "", 0):
-            percent_error = ((reference_lbf - float(ocr_value)) / float(ocr_value)) * 100.0
+            percent_error = ((float(ocr_value) - reference_lbf) / float(ocr_value)) * 100.0
         else:
             percent_error = None
 
-        return {
+        row = {
             "point": (self.capture_target_index + 1) if self.capture_target_index is not None else "",
             "time": datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds"),
             "load_cell": self.selected_load_cell_name.get(),
             "mode": self.mode_var.get(),
-            "method": "manual_weight_gps_gravity",
+            "method": "manual_weight_gps_gravity" if ctx.get("using_gps") else "manual_weight_standard_gravity",
             "sync_mode": "manual_entry",
             "sync_lag_ms": "",
             "sync_confidence": "",
@@ -2159,6 +2323,7 @@ class App(tk.Tk):
             "hadi_raw": "",
             "hadi_lbf": reference_lbf,
             "ocr": ocr_value if ocr_value is not None else "",
+            "ocr_text": ocr_text if ocr_value is not None else "",
             "ocr_edited": False,
             "percent_error": percent_error,
             "captured_hadi_lbf": "",
@@ -2170,6 +2335,8 @@ class App(tk.Tk):
             "gps_longitude": ctx["gps_longitude"],
             "gps_altitude_m": ctx.get("gps_altitude_m", ""),
         }
+        self._set_row_hadi_text(row)
+        return row
 
     def _selected_indexes_for_active_run(self):
         run = self.capture_target_run if self.capture_target_run in (1, 2) else 1
@@ -2209,7 +2376,7 @@ class App(tk.Tk):
         if ocr_value == 0:
             row["percent_error"] = None
         else:
-            row["percent_error"] = ((hadi_value - ocr_value) / ocr_value) * 100.0
+            row["percent_error"] = ((ocr_value - hadi_value) / ocr_value) * 100.0
 
     def _nominal_weight_from_existing_row(self, index: int, run: int):
         existing = self.capture_rows[index].get(f"run{run}")
@@ -2234,7 +2401,7 @@ class App(tk.Tk):
         existing = self.capture_rows[index].get(f"run{run}") or {}
         ocr_value = existing.get("ocr")
         original_hadi = existing.get("pre_w_hadi_lbf", existing.get("hadi_lbf", nominal_weight_lbf))
-        row = self._make_manual_weight_row(nominal_weight_lbf, ocr_value=ocr_value if ocr_value not in ("", None) else None)
+        row = self._make_manual_weight_row(nominal_weight_lbf, ocr_value=ocr_value if ocr_value not in ("", None) else None, ocr_text=existing.get("ocr_text", ""))
         row["point"] = index + 1
         row["run"] = run
         row["pre_w_hadi_lbf"] = original_hadi
@@ -2272,11 +2439,12 @@ class App(tk.Tk):
                 existing["gps_latitude"] = ""
                 existing["gps_longitude"] = ""
                 existing["pre_w_hadi_lbf"] = ""
+                self._set_row_hadi_text(existing)
                 self._recalculate_row_error(existing)
                 toggled_off += 1
             else:
-                # Toggle ON: use the current HADI/local lbf value as the typed value,
-                # and store the nominal weight backed out by gravity factor.
+                # Toggle ON: use the current HADI/local lbf value as the typed value.
+                # GPS correction is disabled by default, so this stays usable with no GPS.
                 nominal_weight_lbf = self._nominal_weight_from_existing_row(index, run)
                 if nominal_weight_lbf is None:
                     missing.append(index + 1)
@@ -2316,7 +2484,7 @@ class App(tk.Tk):
 
     def _set_selected_weight_reference(self):
         try:
-            now_pc, now_wall, target_t, hadi_lbf, hadi_raw, ocr_value = self._current_synced_values()
+            now_pc, now_wall, target_t, hadi_lbf, hadi_raw, ocr_value, ocr_text = self._current_synced_values()
         except RuntimeError as exc:
             messagebox.showwarning("No synced values", str(exc))
             return
@@ -2336,7 +2504,7 @@ class App(tk.Tk):
             messagebox.showwarning("OCR is zero", "Cannot calculate percent error when OCR is zero.")
             return
 
-        percent_error = ((reference_lbf - ocr_value) / ocr_value) * 100.0
+        percent_error = ((ocr_value - reference_lbf) / ocr_value) * 100.0
         target_delay_ms = (now_pc - target_t) * 1000.0
 
         row = {
@@ -2344,7 +2512,7 @@ class App(tk.Tk):
             "time": datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds"),
             "load_cell": self.selected_load_cell_name.get(),
             "mode": self.mode_var.get(),
-            "method": "weight_reference_gps_gravity",
+            "method": "weight_reference_gps_gravity" if ctx.get("using_gps") else "weight_reference_standard_gravity",
             "sync_mode": "manual" if self.sync_manual else "auto",
             "sync_lag_ms": self.sync_lag_seconds * 1000.0,
             "sync_confidence": self.sync_confidence,
@@ -2352,6 +2520,7 @@ class App(tk.Tk):
             "hadi_raw": hadi_raw,
             "hadi_lbf": reference_lbf,
             "ocr": ocr_value,
+            "ocr_text": ocr_text,
             "ocr_edited": False,
             "percent_error": percent_error,
             "captured_hadi_lbf": hadi_lbf,
@@ -2363,12 +2532,13 @@ class App(tk.Tk):
             "gps_longitude": lon,
             "gps_altitude_m": ctx.get("gps_altitude_m", ""),
         }
+        self._set_row_hadi_text(row)
 
         self._insert_or_replace_capture_row(
             row,
             (
-                fmt_lbf(reference_lbf),
-                f"{ocr_value:+.4f}",
+                row.get("hadi_text", self._format_hadi_lbf_text(reference_lbf)),
+                self._format_ocr_text(ocr_text, ocr_value),
                 f"{percent_error:+.2f}%",
             ),
         )
@@ -2393,7 +2563,7 @@ class App(tk.Tk):
             return
 
         try:
-            now_pc, now_wall, target_t, hadi_lbf, hadi_raw, ocr_value = self._current_synced_values()
+            now_pc, now_wall, target_t, hadi_lbf, hadi_raw, ocr_value, ocr_text = self._current_synced_values()
         except RuntimeError as exc:
             messagebox.showwarning("No synced values", str(exc))
             return
@@ -2402,7 +2572,7 @@ class App(tk.Tk):
             messagebox.showwarning("OCR is zero", "Cannot calculate percent error when OCR is zero.")
             return
 
-        percent_error = ((hadi_lbf - ocr_value) / ocr_value) * 100.0
+        percent_error = ((ocr_value - hadi_lbf) / ocr_value) * 100.0
         target_delay_ms = (now_pc - target_t) * 1000.0
 
         row = {
@@ -2418,6 +2588,7 @@ class App(tk.Tk):
             "hadi_raw": hadi_raw,
             "hadi_lbf": hadi_lbf,
             "ocr": ocr_value,
+            "ocr_text": ocr_text,
             "ocr_edited": False,
             "percent_error": percent_error,
             "captured_hadi_lbf": hadi_lbf,
@@ -2429,12 +2600,13 @@ class App(tk.Tk):
             "gps_longitude": "",
             "gps_altitude_m": "",
         }
+        self._set_row_hadi_text(row)
 
         self._insert_or_replace_capture_row(
             row,
             (
-                fmt_lbf(hadi_lbf),
-                f"{ocr_value:+.4f}",
+                row.get("hadi_text", self._format_hadi_lbf_text(hadi_lbf)),
+                self._format_ocr_text(ocr_text, ocr_value),
                 f"{percent_error:+.2f}%",
             ),
         )
