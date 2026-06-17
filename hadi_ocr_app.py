@@ -133,7 +133,12 @@ STANDARD_GRAVITY = 9.80665
 # gravity for weight-reference/W rows, so captures keep working in buildings,
 # labs, or other areas with poor/no GPS. Set this to True only when you
 # intentionally want GPS latitude/elevation gravity correction applied.
-USE_GPS_GRAVITY_CORRECTION = False
+#
+# Enabled: W rows now apply the ASTM Table 1 multiplying factor from the
+# CURRENT GPS fix (latitude + altitude). If no fix has been received yet,
+# the W math safely falls back to standard gravity (MF = 1.0), so capture
+# still works with no GPS.
+USE_GPS_GRAVITY_CORRECTION = True
 
 ASTM_MF_LATITUDES = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70]
 ASTM_MF_ELEVATIONS_M = [0, 500, 1000, 1500, 2000, 2500]
@@ -156,50 +161,32 @@ ASTM_MF_TABLE = {
 }
 
 
-def _bracket(value: float, grid: list[float]):
-    """Return lower/upper grid values for interpolation, clamped to table range."""
-    if value <= grid[0]:
-        return grid[0], grid[0]
-    if value >= grid[-1]:
-        return grid[-1], grid[-1]
-    for lo, hi in zip(grid, grid[1:]):
-        if lo <= value <= hi:
-            return lo, hi
-    return grid[-1], grid[-1]
+def _nearest(value: float, grid: list[float]) -> float:
+    """Return the grid value closest to `value`.
 
-
-def _lerp(a: float, b: float, t: float) -> float:
-    return a + (b - a) * t
+    On an exact midpoint (e.g. 42.5 between 40 and 45) the lower grid value is
+    chosen, so the result is deterministic. Values past either end of the grid
+    resolve to the nearest edge.
+    """
+    return min(grid, key=lambda g: (abs(g - value), g))
 
 
 def astm_multiplying_factor(latitude_deg: float, altitude_m: Optional[float] = None) -> float:
-    """ASTM Table 1 MF, bilinearly interpolated by latitude and elevation.
+    """ASTM Table 1 MF, using the NEAREST tabulated cell (no interpolation).
 
     The table is titled "Multiplying Factor, MF, In Air at Various Latitudes".
     Latitude uses absolute latitude. Elevation is meters above sea level.
     If altitude is unavailable, elevation is assumed to be 0 m.
-    Values outside the displayed table range are clamped to the nearest table edge.
+    The nearest tabulated latitude and the nearest tabulated elevation are
+    selected independently, and that single table value is returned as-is.
     """
     lat = abs(float(latitude_deg))
     elev = 0.0 if altitude_m is None else max(0.0, float(altitude_m))
 
-    lat0, lat1 = _bracket(lat, ASTM_MF_LATITUDES)
-    elev0, elev1 = _bracket(elev, ASTM_MF_ELEVATIONS_M)
-
-    i0 = ASTM_MF_ELEVATIONS_M.index(elev0)
-    i1 = ASTM_MF_ELEVATIONS_M.index(elev1)
-
-    q00 = ASTM_MF_TABLE[lat0][i0]
-    q01 = ASTM_MF_TABLE[lat0][i1]
-    q10 = ASTM_MF_TABLE[lat1][i0]
-    q11 = ASTM_MF_TABLE[lat1][i1]
-
-    tx = 0.0 if lat1 == lat0 else (lat - lat0) / (lat1 - lat0)
-    ty = 0.0 if elev1 == elev0 else (elev - elev0) / (elev1 - elev0)
-
-    low = _lerp(q00, q10, tx)
-    high = _lerp(q01, q11, tx)
-    return _lerp(low, high, ty)
+    nearest_lat = _nearest(lat, ASTM_MF_LATITUDES)
+    nearest_elev = _nearest(elev, ASTM_MF_ELEVATIONS_M)
+    elev_index = ASTM_MF_ELEVATIONS_M.index(nearest_elev)
+    return ASTM_MF_TABLE[nearest_lat][elev_index]
 
 
 def normal_gravity_m_s2(latitude_deg: float, altitude_m: Optional[float] = None) -> float:
@@ -413,6 +400,10 @@ class App(tk.Tk):
         self.capture_target_run = 1
         self.point_count_var = tk.StringVar(value="10")
         self.custom_point_count_var = tk.StringVar(value="10")
+        # Capacity of the cell/instrument being calibrated. Drives the
+        # auto-generated target list and the 105% overload warning.
+        self.uut_capacity_var = tk.StringVar(value="")
+        self.uut_capacity_unit_var = tk.StringVar(value="LBF")
         self.ocr_edit_entry = None
         self.ocr_edit_item = None
         self.ocr_edit_row_index = None
@@ -437,6 +428,10 @@ class App(tk.Tk):
         self._last_sync_update = 0.0
 
         self.latest_gps: Optional[GPSFix] = None
+        # One MF for the whole session: locked to the first valid GPS fix.
+        # All W rows use this single value (ASTM Table 1), so they cannot drift
+        # as new fixes stream in.
+        self.locked_gps: Optional[GPSFix] = None
         self.gps_status_var = tk.StringVar(value="GPS optional: waiting (W uses standard gravity)")
         self.weight_status_var = tk.StringVar(value="Select rows and click SELECT / UNSELECT W")
         self.manual_weight_var = tk.StringVar(value="")
@@ -621,6 +616,21 @@ class App(tk.Tk):
         ).pack(side="left", padx=8)
         ttk.Button(btns, text="Clear", command=self._clear_captures).pack(side="left")
 
+        ttk.Label(btns, text="Cell Capacity").pack(side="left", padx=(14, 4))
+        self.uut_capacity_entry = ttk.Entry(btns, textvariable=self.uut_capacity_var, width=9)
+        self.uut_capacity_entry.pack(side="left")
+        self.uut_capacity_entry.bind("<Return>", lambda _e: self._on_uut_capacity_change())
+        self.uut_capacity_entry.bind("<FocusOut>", lambda _e: self._on_uut_capacity_change())
+        self.uut_capacity_unit_combo = ttk.Combobox(
+            btns,
+            textvariable=self.uut_capacity_unit_var,
+            values=["LBF", "KGF", "N", "kN", "gF", "t"],
+            state="readonly",
+            width=5,
+        )
+        self.uut_capacity_unit_combo.pack(side="left", padx=(3, 0))
+        self.uut_capacity_unit_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_uut_capacity_change())
+
         ttk.Label(btns, text="Points").pack(side="left", padx=(14, 4))
         self.point_count_combo = ttk.Combobox(
             btns,
@@ -647,18 +657,20 @@ class App(tk.Tk):
         ttk.Label(tables, text="Run 1", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 6))
         ttk.Label(tables, text="Run 2", font=("Segoe UI", 10, "bold")).grid(row=0, column=1, sticky="w", padx=(6, 0))
 
-        run_cols = ("point", "hadi", "ocr", "error")
+        run_cols = ("point", "target", "hadi", "ocr", "error")
         self.run1_tree = ttk.Treeview(tables, columns=run_cols, show="headings", height=18, selectmode="extended")
         self.run2_tree = ttk.Treeview(tables, columns=run_cols, show="headings", height=18, selectmode="extended")
 
         for tree in (self.run1_tree, self.run2_tree):
             tree.heading("point", text="#")
+            tree.heading("target", text="Target")
             tree.heading("hadi", text="HADI")
             tree.heading("ocr", text="OCR")
             tree.heading("error", text="%")
             tree.column("point", width=38, anchor="center", stretch=False)
-            tree.column("hadi", width=104, anchor="center", stretch=False)
-            tree.column("ocr", width=104, anchor="center", stretch=False)
+            tree.column("target", width=84, anchor="center", stretch=False)
+            tree.column("hadi", width=100, anchor="center", stretch=False)
+            tree.column("ocr", width=100, anchor="center", stretch=False)
             tree.column("error", width=58, anchor="center", stretch=False)
             tree.tag_configure("warn", background="#fff3cd")
             tree.tag_configure("bad", background="#f8d7da")
@@ -676,7 +688,7 @@ class App(tk.Tk):
         # Compatibility alias for older helper code paths.
         self.tree = self.run1_tree
 
-        self._initialize_point_rows(10)
+        self._apply_point_count()  # 10-point preset: 10 load targets + a zero row
 
     def _build_connection_tab(self, root):
         pad = {"padx": 10, "pady": 8}
@@ -927,25 +939,35 @@ class App(tk.Tk):
             row["hadi_text"] = self._format_hadi_lbf_text(row.get("hadi_lbf"), show_plus=False)
 
     def _update_capacity_warning(self, reading: Optional[HADIReading] = None) -> None:
-        """Warn when the load cell force exceeds 105% of selected capacity.
+        """Red overload warning when force exceeds 105% of a capacity.
 
-        The comparison is always done in lbf because calibration coefficients
-        produce lbf. The displayed warning follows the user's selected units.
+        Checks the cell being calibrated (UUT) first, since that's the device
+        being protected, then the reference load cell. The comparison is done in
+        lbf; the message follows the user's selected display units.
         """
-        capacity_lbf = self._capacity_limit_lbf()
-        if capacity_lbf is None or reading is None:
+        if reading is None:
             self.capacity_warning_var.set("")
             return
 
         force_lbf = abs(float(reading.force_lbf))
-        limit_lbf = capacity_lbf * 1.05
-        if force_lbf >= limit_lbf:
+
+        uut_lbf = self._uut_capacity_lbf()
+        if uut_lbf is not None and force_lbf >= uut_lbf * 1.05:
+            self.capacity_warning_var.set(
+                f"OVERLOAD: {self._format_force_for_current_units(force_lbf)} > 105% of "
+                f"{self._format_force_for_current_units(uut_lbf)} cell capacity"
+            )
+            return
+
+        capacity_lbf = self._capacity_limit_lbf()
+        if capacity_lbf is not None and force_lbf >= capacity_lbf * 1.05:
             self.capacity_warning_var.set(
                 f"OVER CAPACITY: {self._format_force_for_current_units(force_lbf)} / "
-                f"{self._format_force_for_current_units(limit_lbf)} max"
+                f"{self._format_force_for_current_units(capacity_lbf * 1.05)} max"
             )
-        else:
-            self.capacity_warning_var.set("")
+            return
+
+        self.capacity_warning_var.set("")
 
     def _auto_connect_on_launch(self):
         # Start OCR listener automatically. It is just a local UDP listener,
@@ -1197,40 +1219,33 @@ class App(tk.Tk):
             gravity_factor=g / STANDARD_GRAVITY,
         )
 
-        # Always keep/display the latest GPS fix so the operator can verify that
-        # the phone is sending coordinates. By default W-row math still ignores
-        # GPS and uses standard gravity, so moving the phone cannot change the
-        # captured weight values.
+        # Always keep the latest fix so the operator can see the phone is
+        # streaming coordinates.
         self.latest_gps = fix
 
-        if not USE_GPS_GRAVITY_CORRECTION:
-            if fix.altitude_m is None:
-                self.gps_status_var.set(
-                    f"GPS {fix.latitude:.5f}, {fix.longitude:.5f} | ASTM MF {fix.gravity_factor:.7f} | alt 0m | W uses standard g"
-                )
-            else:
-                self.gps_status_var.set(
-                    f"GPS {fix.latitude:.5f}, {fix.longitude:.5f} | alt {fix.altitude_m:.1f}m | ASTM MF {fix.gravity_factor:.7f} | W uses standard g"
-                )
-            return
-
-        # If GPS gravity correction is deliberately re-enabled later, lock to the
-        # first valid fix for the run so moving the phone up/down cannot give
-        # different W rows different gravity factors.
-        if not hasattr(self, "locked_gps"):
-            self.locked_gps = None
-        if self.locked_gps is None:
+        # Lock the first VALID fix for the session and use it for every W row.
+        # "Valid" skips the null-island (0, 0) reading a phone can emit before
+        # it has acquired, which would otherwise bake a wrong latitude into the
+        # whole run. To re-lock (e.g. after relocating), restart the app.
+        if (
+            USE_GPS_GRAVITY_CORRECTION
+            and self.locked_gps is None
+            and not (abs(fix.latitude) < 1e-6 and abs(fix.longitude) < 1e-6)
+        ):
             self.locked_gps = fix
 
-        locked = self.locked_gps
-        if locked.altitude_m is None:
-            self.gps_status_var.set(
-                f"GPS locked {locked.latitude:.5f}, {locked.longitude:.5f} | ASTM MF {locked.gravity_factor:.7f} | alt 0m"
-            )
+        ref = self.locked_gps if (USE_GPS_GRAVITY_CORRECTION and self.locked_gps) else fix
+        alt_txt = "alt 0m" if ref.altitude_m is None else f"alt {ref.altitude_m:.1f}m"
+        if USE_GPS_GRAVITY_CORRECTION and self.locked_gps is not None:
+            w_txt = "W locked to this MF"
+        elif USE_GPS_GRAVITY_CORRECTION:
+            w_txt = "waiting for valid fix (W uses standard g)"
         else:
-            self.gps_status_var.set(
-                f"GPS locked {locked.latitude:.5f}, {locked.longitude:.5f} | alt {locked.altitude_m:.1f}m | ASTM MF {locked.gravity_factor:.7f}"
-            )
+            w_txt = "W uses standard g"
+        self.gps_status_var.set(
+            f"GPS {ref.latitude:.5f}, {ref.longitude:.5f} | {alt_txt} | "
+            f"ASTM MF {ref.gravity_factor:.7f} | {w_txt}"
+        )
 
     @staticmethod
     def _interp(samples, t, attr):
@@ -1458,41 +1473,133 @@ class App(tk.Tk):
             except ValueError:
                 messagebox.showerror("Invalid point count", "Enter a whole number of points.")
                 return
+            targets = None
         else:
-            count = int(choice)
+            # Presets generate a target list from the cell capacity and always
+            # add a trailing zero row, so "10" -> 11 rows, "20" -> 20 rows.
+            loads = self._target_loads_for_choice(choice)
+            count = len(loads) + 1
+            targets = self._scaled_targets(loads)
 
         if count <= 0:
             messagebox.showerror("Invalid point count", "Point count must be greater than zero.")
             return
 
         current_count = len(self.capture_rows) if self.capture_rows else 0
-        if current_count == 0:
+
+        if current_count and count < current_count:
+            removed_rows = self.capture_rows[count:]
+            if any(self._point_has_data(row) for row in removed_rows):
+                if not messagebox.askyesno(
+                    "Remove points?",
+                    f"Changing to {count} points will remove saved values after point {count}. Continue?",
+                ):
+                    # Best-effort restore of the dropdown to match the kept rows.
+                    if current_count == 11:
+                        self.point_count_var.set("10")
+                    elif current_count == 20:
+                        self.point_count_var.set("20")
+                    else:
+                        self.point_count_var.set("Custom")
+                        self.custom_point_count_var.set(str(current_count))
+                    return
+
+        if not self.capture_rows:
             self._initialize_point_rows(count)
-            return
-        if count == current_count:
-            return
-        if count > current_count:
+        else:
             self._resize_point_rows(count, keep_existing=True)
-            return
 
-        removed_rows = self.capture_rows[count:]
-        losing_saved_values = any(self._point_has_data(row) for row in removed_rows)
-        if losing_saved_values:
-            if not messagebox.askyesno(
-                "Remove points?",
-                f"Changing from {current_count} to {count} points will remove saved values after point {count}. Continue?",
-            ):
-                if current_count in (10, 20):
-                    self.point_count_var.set(str(current_count))
-                else:
-                    self.point_count_var.set("Custom")
-                    self.custom_point_count_var.set(str(current_count))
-                return
+        self._assign_targets(targets)
 
-        self._resize_point_rows(count, keep_existing=True)
+        if choice != "Custom" and targets is None:
+            self.weight_status_var.set("Enter Cell Capacity (lbf) to fill the Target column.")
+
+    def _target_loads_for_choice(self, choice: str):
+        """Return the load fractions (of capacity) for a preset, or None for Custom.
+
+        10-point: 10%, 20% ... 100%  (then a zero row is appended -> 11 rows).
+        20-point: 1%..10% in 1% steps, then 20%..100% in 10% steps
+                  (19 loads, then a zero row -> 20 rows).
+        """
+        if choice == "10":
+            return [i / 10 for i in range(1, 11)]
+        if choice == "20":
+            fine = [i / 100 for i in range(1, 11)]    # 1% .. 10%
+            coarse = [i / 10 for i in range(2, 11)]   # 20% .. 100%
+            return fine + coarse
+        return None
+
+    def _scaled_targets(self, loads):
+        """Scale load fractions by the cell capacity and append a zero row.
+
+        Returns None if no valid capacity has been entered yet, so the rows are
+        still created but the Target column stays blank until a capacity is set.
+        """
+        if loads is None:
+            return None
+        capacity = self._uut_capacity_lbf()
+        if capacity is None:
+            return None
+        return [round(capacity * f, 6) for f in loads] + [0.0]
+
+    def _assign_targets(self, targets):
+        """Write target_lbf onto each point row (or clear it) and redraw."""
+        for i, row in enumerate(self.capture_rows):
+            if targets is not None and i < len(targets):
+                row["target_lbf"] = targets[i]
+            else:
+                row["target_lbf"] = None
+        self._redraw_point_table()
+
+    def _regenerate_targets(self):
+        """Refill the Target column for the current preset without resizing."""
+        loads = self._target_loads_for_choice(self.point_count_var.get())
+        self._assign_targets(self._scaled_targets(loads) if loads is not None else None)
+
+    def _uut_capacity_lbf(self) -> Optional[float]:
+        """Capacity of the cell being calibrated, converted to lbf.
+
+        The value is entered in the unit chosen next to the field; force math
+        in this app is all in lbf, so convert here.
+        """
+        txt = self.uut_capacity_var.get().strip()
+        if not txt:
+            return None
+        try:
+            capacity = float(txt)
+        except ValueError:
+            return None
+        if capacity <= 0:
+            return None
+        factor = HADI_UNIT_FACTORS.get(self.uut_capacity_unit_var.get(), 1.0)
+        return capacity / factor  # unit -> lbf
+
+    def _on_uut_capacity_change(self):
+        """Capacity edited: refill preset targets and refresh the overload check."""
+        if self.point_count_var.get() != "Custom":
+            loads = self._target_loads_for_choice(self.point_count_var.get())
+            expected_rows = (len(loads) + 1) if loads is not None else len(self.capture_rows)
+            if len(self.capture_rows) != expected_rows:
+                self._apply_point_count()
+            else:
+                self._regenerate_targets()
+        self._update_capacity_warning(getattr(self, "latest_hadi", None))
+
+    def _format_target_text(self, value) -> str:
+        if value in (None, ""):
+            return ""
+        try:
+            v = float(value)
+        except Exception:
+            return str(value)
+        # Targets are stored in lbf; show them in the chosen capacity unit.
+        v *= HADI_UNIT_FACTORS.get(self.uut_capacity_unit_var.get(), 1.0)
+        if v == int(v):
+            return f"{int(v)}"
+        return f"{v:.3f}".rstrip("0").rstrip(".")
 
     def _blank_point_row(self, point_number: int) -> dict:
-        return {"point": point_number, "run1": None, "run2": None}
+        return {"point": point_number, "run1": None, "run2": None, "target_lbf": None}
 
     def _point_has_data(self, point_row: dict) -> bool:
         return bool(point_row and (point_row.get("run1") is not None or point_row.get("run2") is not None))
@@ -1544,6 +1651,7 @@ class App(tk.Tk):
         point_label = f"{index + 1}w" if is_weight else str(index + 1)
         return (
             point_label,
+            self._format_target_text(point_row.get("target_lbf")),
             (run_row.get("hadi_text") or self._format_hadi_lbf_text(run_row.get("hadi_lbf"), show_plus=False))
             if run_row and run_row.get("hadi_lbf") is not None else "",
             self._ocr_text_for_row(run_row),
@@ -1561,12 +1669,33 @@ class App(tk.Tk):
 
     @staticmethod
     def _format_run_percent(run_row):
-        if not run_row or run_row.get("percent_error") is None:
+        if not run_row:
+            return ""
+        if run_row.get("percent_error_na"):
+            return "NA"
+        if run_row.get("percent_error") is None:
             return ""
         try:
             return f"{float(run_row.get('percent_error')):+.2f}%"
         except Exception:
             return ""
+
+    @staticmethod
+    def _calculate_percent_error(ocr_value, hadi_value):
+        """Return (percent_error, is_na).
+
+        A zero OCR/reference value is still a valid capture value, but percent
+        error cannot be computed because the denominator would be zero. Store it
+        as NA instead of rejecting the row.
+        """
+        try:
+            ocr = float(ocr_value)
+            hadi = float(hadi_value)
+        except Exception:
+            return None, False
+        if ocr == 0:
+            return None, True
+        return ((ocr - hadi) / ocr) * 100.0, False
 
     def _filled_count(self):
         return sum(
@@ -1704,8 +1833,9 @@ class App(tk.Tk):
         item_id = tree.identify_row(event.y)
         col_id = tree.identify_column(event.x)
 
-        # Columns in each run tree are #1 Point, #2 HADI/weight, #3 OCR, #4 %.
-        if not item_id or col_id not in ("#2", "#3"):
+        # Columns in each run tree are #1 Point, #2 Target, #3 HADI/weight,
+        # #4 OCR, #5 %. Only HADI (#3) and OCR (#4) are editable.
+        if not item_id or col_id not in ("#3", "#4"):
             return "break"
 
         children = list(tree.get_children())
@@ -1716,12 +1846,12 @@ class App(tk.Tk):
 
         # HADI/weight can be edited even when the run is empty.
         # OCR can only be edited after the run exists.
-        if col_id == "#3" and (row_index >= len(self.capture_rows) or self.capture_rows[row_index].get(f"run{run}") is None):
+        if col_id == "#4" and (row_index >= len(self.capture_rows) or self.capture_rows[row_index].get(f"run{run}") is None):
             return "break"
 
         self.suppress_next_tree_click = True
         self.suppress_next_tree_select = True
-        kind = "hadi" if col_id == "#2" else "ocr"
+        kind = "hadi" if col_id == "#3" else "ocr"
         self._start_cell_edit(tree, item_id, row_index, run, kind)
         return "break"
 
@@ -1729,7 +1859,7 @@ class App(tk.Tk):
         if self.ocr_edit_entry is not None:
             self._cancel_ocr_edit()
 
-        column_id = "#2" if kind == "hadi" else "#3"
+        column_id = "#3" if kind == "hadi" else "#4"
         bbox = tree.bbox(item_id, column_id)
         if not bbox:
             return
@@ -1898,10 +2028,13 @@ class App(tk.Tk):
             except Exception:
                 hadi_value = None
 
-            if hadi_value is not None and new_value != 0:
-                run_row["percent_error"] = ((new_value - hadi_value) / new_value) * 100.0
+            if hadi_value is not None:
+                err, is_na = self._calculate_percent_error(new_value, hadi_value)
+                run_row["percent_error"] = err
+                run_row["percent_error_na"] = is_na
             else:
                 run_row["percent_error"] = None
+                run_row["percent_error_na"] = False
 
         if tree is not None and item_id:
             tree.item(item_id, values=self._tree_values_for_run(row_index, run))
@@ -2007,7 +2140,9 @@ class App(tk.Tk):
         return f"{txt}{suffix}"
 
     @staticmethod
-    def _csv_fmt_error(value):
+    def _csv_fmt_error(value, is_na=False):
+        if is_na:
+            return "NA"
         if value in (None, ""):
             return ""
         try:
@@ -2027,7 +2162,7 @@ class App(tk.Tk):
             rows.append([
                 self._ocr_text_for_row(run_row, show_plus=False),
                 run_row.get("hadi_text") or self._format_hadi_lbf_text(run_row.get("hadi_lbf"), show_plus=False),
-                self._csv_fmt_error(run_row.get("percent_error")),
+                self._csv_fmt_error(run_row.get("percent_error"), run_row.get("percent_error_na", False)),
             ])
         return rows
 
@@ -2128,15 +2263,13 @@ class App(tk.Tk):
             messagebox.showwarning("No OCR value", str(exc))
             return False
 
-        if ocr_value == 0:
-            messagebox.showwarning("OCR is zero", "Cannot calculate percent error when OCR is zero.")
-            return False
-
         try:
             hadi_lbf = float(run_row.get("hadi_lbf"))
         except Exception:
             messagebox.showwarning("Missing weight", "This W row does not have a HADI/weight value.")
             return False
+
+        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_lbf)
 
         run_row["time"] = datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds")
         run_row["load_cell"] = self.selected_load_cell_name.get()
@@ -2149,7 +2282,8 @@ class App(tk.Tk):
         run_row["ocr"] = ocr_value
         run_row["ocr_text"] = ocr_text
         run_row["ocr_edited"] = False
-        run_row["percent_error"] = ((ocr_value - hadi_lbf) / ocr_value) * 100.0
+        run_row["percent_error"] = percent_error
+        run_row["percent_error_na"] = percent_error_na
         self._set_row_hadi_text(run_row)
 
         tree = self._tree_for_run(run)
@@ -2219,9 +2353,13 @@ class App(tk.Tk):
             hadi = self.latest_hadi.force_lbf if self.latest_hadi else None
             with self.ocr_lock:
                 ocr = self.latest_ocr.value if self.latest_ocr else None
-            if hadi is None or ocr is None or ocr == 0:
+            if hadi is None or ocr is None:
                 raise ValueError
-            err = ((ocr - hadi) / ocr) * 100.0
+            err, is_na = self._calculate_percent_error(ocr, hadi)
+            if is_na:
+                self.live_error_var.set("NA")
+                self._set_live_error_color(None)
+                return
             self.live_error_var.set(f"{err:+.2f}%")
             self._set_live_error_color(err)
         except Exception:
@@ -2264,7 +2402,7 @@ class App(tk.Tk):
         return now_pc, time.time(), target_t, hadi_lbf, hadi_raw, ocr_value, ocr_text
 
     def _gravity_context(self):
-        gps = getattr(self, "locked_gps", None) if USE_GPS_GRAVITY_CORRECTION else None
+        gps = self.locked_gps if USE_GPS_GRAVITY_CORRECTION else None
         if gps is None:
             return {
                 "gravity_factor": 1.0,
@@ -2305,10 +2443,7 @@ class App(tk.Tk):
         gravity_factor = ctx["gravity_factor"]
         reference_lbf = nominal_weight_lbf * gravity_factor
 
-        if ocr_value not in (None, "", 0):
-            percent_error = ((float(ocr_value) - reference_lbf) / float(ocr_value)) * 100.0
-        else:
-            percent_error = None
+        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, reference_lbf)
 
         row = {
             "point": (self.capture_target_index + 1) if self.capture_target_index is not None else "",
@@ -2326,6 +2461,7 @@ class App(tk.Tk):
             "ocr_text": ocr_text if ocr_value is not None else "",
             "ocr_edited": False,
             "percent_error": percent_error,
+            "percent_error_na": percent_error_na,
             "captured_hadi_lbf": "",
             "conventional_lbf_from_hadi": "",
             "nominal_weight_lbf": nominal_weight_lbf,
@@ -2367,16 +2503,9 @@ class App(tk.Tk):
         return values
 
     def _recalculate_row_error(self, row: dict):
-        try:
-            hadi_value = float(row.get("hadi_lbf"))
-            ocr_value = float(row.get("ocr"))
-        except Exception:
-            row["percent_error"] = None
-            return
-        if ocr_value == 0:
-            row["percent_error"] = None
-        else:
-            row["percent_error"] = ((ocr_value - hadi_value) / ocr_value) * 100.0
+        err, is_na = self._calculate_percent_error(row.get("ocr"), row.get("hadi_lbf"))
+        row["percent_error"] = err
+        row["percent_error_na"] = is_na
 
     def _nominal_weight_from_existing_row(self, index: int, run: int):
         existing = self.capture_rows[index].get(f"run{run}")
@@ -2400,7 +2529,9 @@ class App(tk.Tk):
     def _apply_manual_weight_to_index(self, index: int, run: int, nominal_weight_lbf: float):
         existing = self.capture_rows[index].get(f"run{run}") or {}
         ocr_value = existing.get("ocr")
-        original_hadi = existing.get("pre_w_hadi_lbf", existing.get("hadi_lbf", nominal_weight_lbf))
+        original_hadi = existing.get("pre_w_hadi_lbf")
+        if original_hadi in (None, ""):
+            original_hadi = existing.get("hadi_lbf", nominal_weight_lbf)
         row = self._make_manual_weight_row(nominal_weight_lbf, ocr_value=ocr_value if ocr_value not in ("", None) else None, ocr_text=existing.get("ocr_text", ""))
         row["point"] = index + 1
         row["run"] = run
@@ -2438,9 +2569,12 @@ class App(tk.Tk):
                 existing["gravity_m_s2"] = ""
                 existing["gps_latitude"] = ""
                 existing["gps_longitude"] = ""
-                existing["pre_w_hadi_lbf"] = ""
+                existing["pre_w_hadi_lbf"] = restore_value
                 self._set_row_hadi_text(existing)
                 self._recalculate_row_error(existing)
+                tree = self._tree_for_run(run)
+                item_id = tree.get_children()[index]
+                tree.item(item_id, values=self._tree_values_for_run(index, run))
                 toggled_off += 1
             else:
                 # Toggle ON: use the current HADI/local lbf value as the typed value.
@@ -2500,11 +2634,7 @@ class App(tk.Tk):
         nominal_weight_lbf = nearest_standard_weight_lbf(conventional_lbf)
         reference_lbf = nominal_weight_lbf * gravity_factor
 
-        if ocr_value == 0:
-            messagebox.showwarning("OCR is zero", "Cannot calculate percent error when OCR is zero.")
-            return
-
-        percent_error = ((ocr_value - reference_lbf) / ocr_value) * 100.0
+        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, reference_lbf)
         target_delay_ms = (now_pc - target_t) * 1000.0
 
         row = {
@@ -2523,6 +2653,7 @@ class App(tk.Tk):
             "ocr_text": ocr_text,
             "ocr_edited": False,
             "percent_error": percent_error,
+            "percent_error_na": percent_error_na,
             "captured_hadi_lbf": hadi_lbf,
             "conventional_lbf_from_hadi": conventional_lbf,
             "nominal_weight_lbf": nominal_weight_lbf,
@@ -2539,7 +2670,7 @@ class App(tk.Tk):
             (
                 row.get("hadi_text", self._format_hadi_lbf_text(reference_lbf)),
                 self._format_ocr_text(ocr_text, ocr_value),
-                f"{percent_error:+.2f}%",
+                "NA" if percent_error_na else f"{percent_error:+.2f}%",
             ),
         )
         self._update_point_count_label()
@@ -2568,11 +2699,7 @@ class App(tk.Tk):
             messagebox.showwarning("No synced values", str(exc))
             return
 
-        if ocr_value == 0:
-            messagebox.showwarning("OCR is zero", "Cannot calculate percent error when OCR is zero.")
-            return
-
-        percent_error = ((ocr_value - hadi_lbf) / ocr_value) * 100.0
+        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_lbf)
         target_delay_ms = (now_pc - target_t) * 1000.0
 
         row = {
@@ -2591,6 +2718,7 @@ class App(tk.Tk):
             "ocr_text": ocr_text,
             "ocr_edited": False,
             "percent_error": percent_error,
+            "percent_error_na": percent_error_na,
             "captured_hadi_lbf": hadi_lbf,
             "conventional_lbf_from_hadi": "",
             "nominal_weight_lbf": "",
@@ -2607,7 +2735,7 @@ class App(tk.Tk):
             (
                 row.get("hadi_text", self._format_hadi_lbf_text(hadi_lbf)),
                 self._format_ocr_text(ocr_text, ocr_value),
-                f"{percent_error:+.2f}%",
+                "NA" if percent_error_na else f"{percent_error:+.2f}%",
             ),
         )
         self._update_point_count_label()
@@ -2648,6 +2776,7 @@ class App(tk.Tk):
 
         count = len(self.capture_rows) if self.capture_rows else 10
         self._initialize_point_rows(count)
+        self._regenerate_targets()  # keep the target list after clearing data
         self.dirty_data = False
         self.autosave_name = None
 
