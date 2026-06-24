@@ -280,7 +280,7 @@ final class OCRStreamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
     // MARK: Camera setup
     private func configureSession() {
         session.beginConfiguration()
-        session.sessionPreset = .hd1920x1080
+        session.sessionPreset = .hd1280x720
 
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device),
@@ -292,7 +292,8 @@ final class OCRStreamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSam
 
         videoOutput.alwaysDiscardsLateVideoFrames = true   // critical for low latency
         videoOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            kCVPixelBufferPixelFormatTypeKey as String:
+                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         ]
         videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
         if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
@@ -556,3 +557,4 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
         }
     }
 }
+
